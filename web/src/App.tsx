@@ -6,6 +6,7 @@ import './App.css'
 
 type Nutrients = { energy_kcal: number | null; protein_g: number | null; fat_g: number | null; carbohydrate_g: number | null; fiber_g?: number | null }
 type Food = { fdcId?: number; name: string; brand?: string | null; dataType?: string; nutrientsPer100g: Nutrients; source: string; sourceReference?: string }
+type DraftItem = { name: string; quantityGrams: number | null; state: string | null; needsConfirmation: boolean; idempotencyKey: string; selectedFood?: Food; matches?: Food[]; searching?: boolean }
 type Entry = { id: string; name: string; quantity_g: number; meal_type: MealType; energy_kcal_snapshot: number | null; protein_g_snapshot: number | null; fat_g_snapshot: number | null; carbohydrate_g_snapshot: number | null; fiber_g_snapshot?: number | null; source_type: string; source_reference?: string | null }
 type MealType = 'breakfast' | 'lunch' | 'dinner' | 'snack'
 type Page = 'today' | 'diary' | 'analytics' | 'recipes' | 'settings'
@@ -56,9 +57,10 @@ function App() {
   const [manualCarbs, setManualCarbs] = useState('')
   const [description, setDescription] = useState('')
   const [photo, setPhoto] = useState<File | null>(null)
-  const [draftItems, setDraftItems] = useState<Array<{ name: string; quantityGrams: number | null; state: string | null; needsConfirmation: boolean }>>([])
+  const [draftItems, setDraftItems] = useState<DraftItem[]>([])
   const [draftQuestions, setDraftQuestions] = useState<string[]>([])
   const [analysisBusy, setAnalysisBusy] = useState(false)
+  const [confirmBusy, setConfirmBusy] = useState(false)
 
   useEffect(() => {
     if (!supabase) return
@@ -122,20 +124,31 @@ function App() {
     return data.id
   }
 
+  async function refreshDayEntries() {
+    if (!supabase) return
+    const { data } = await supabase.from('meals').select('id, meal_type, meal_items(id, custom_name, quantity_g, energy_kcal_snapshot, protein_g_snapshot, fat_g_snapshot, carbohydrate_g_snapshot, fiber_g_snapshot, source_type, source_reference)').eq('meal_date', selectedDate)
+    setEntries((data ?? []).flatMap((meal: any) => (meal.meal_items ?? []).map((item: any) => ({ ...item, meal_type: meal.meal_type, name: item.custom_name ?? 'Продукт' }))))
+  }
+
   async function saveFood(selected: Food, sourceType: 'manual' | 'photo' | 'text' = 'manual') {
     if (savingEntry) return
     const amountResult = gramsSchema.safeParse(grams)
     if (!amountResult.success) { setNotice('Укажите массу от 1 до 5000 г.'); return }
     const amount = amountResult.data
     setSavingEntry(true)
+    if (!supabase) { setSavingEntry(false); return }
+    if (selected.fdcId && selected.source === 'USDA FoodData Central') {
+      const { error } = await supabase.functions.invoke('add-food', { body: { fdcId: selected.fdcId, quantityGrams: amount, mealDate: selectedDate, mealType, idempotencyKey: saveIntentId } })
+      if (error) { setNotice('Не удалось подтвердить данные USDA на сервере. Проверьте функцию add-food и повторите попытку.'); setSavingEntry(false); return }
+      setNotice('Добавлено в дневник с проверенными данными USDA.'); setModal(false); setFood(null); setQuery(''); setResults([]); await refreshDayEntries(); setSavingEntry(false); return
+    }
     const mealId = await ensureMeal(); if (!mealId || !supabase) { setSavingEntry(false); return }
     const n = selected.nutrientsPer100g
     const snapshot = { energy_kcal_snapshot: portionValue(n.energy_kcal, amount), protein_g_snapshot: portionValue(n.protein_g, amount), fat_g_snapshot: portionValue(n.fat_g, amount), carbohydrate_g_snapshot: portionValue(n.carbohydrate_g, amount), fiber_g_snapshot: portionValue(n.fiber_g, amount) }
     const { error } = await supabase.from('meal_items').insert({ idempotency_key: saveIntentId, meal_id: mealId, food_id: null, custom_name: selected.name, quantity_g: amount, ...snapshot, nutrition_snapshot: { ...n, data_source: selected.source, source_reference: selected.sourceReference ?? null, brand: selected.brand ?? null }, source_type: sourceType, source_reference: selected.sourceReference ?? null })
     if (error && error.code !== '23505') { setNotice(error.message); setSavingEntry(false); return }
     setNotice(error ? 'Эта запись уже была сохранена.' : 'Добавлено в дневник и сохранено в облаке.'); setModal(false); setFood(null); setQuery(''); setResults([]); setManualName('')
-    const { data } = await supabase.from('meals').select('id, meal_type, meal_items(id, custom_name, quantity_g, energy_kcal_snapshot, protein_g_snapshot, fat_g_snapshot, carbohydrate_g_snapshot, fiber_g_snapshot, source_type, source_reference)').eq('meal_date', selectedDate)
-    setEntries((data ?? []).flatMap((meal: any) => (meal.meal_items ?? []).map((item: any) => ({ ...item, meal_type: meal.meal_type, name: item.custom_name ?? 'Продукт' }))))
+    await refreshDayEntries()
     setSavingEntry(false)
   }
 
@@ -153,7 +166,7 @@ function App() {
     const { data, error } = await supabase.functions.invoke('parse-meal', { body: { description: description.trim() } })
     setAnalysisBusy(false)
     if (error) setNotice('Текстовый разбор недоступен: настройте серверный ключ OpenAI и функцию parse-meal.')
-    else { setDraftItems(data?.items ?? []); setDraftQuestions(data?.questions ?? []) }
+    else { setDraftItems((data?.items ?? []).map((item: Omit<DraftItem, 'idempotencyKey'>) => ({ ...item, idempotencyKey: crypto.randomUUID() }))); setDraftQuestions(data?.questions ?? []) }
   }
 
   async function analyzePhoto(event: FormEvent) {
@@ -163,7 +176,38 @@ function App() {
     const { data, error } = await supabase.functions.invoke('food-analysis', { body: formData })
     setAnalysisBusy(false)
     if (error) setNotice('Фотоанализ недоступен: настройте серверный ключ OpenAI и функцию food-analysis.')
-    else { setDraftItems(data?.items ?? []); setDraftQuestions(data?.questions ?? []) }
+    else { setDraftItems((data?.items ?? []).map((item: Omit<DraftItem, 'idempotencyKey'>) => ({ ...item, idempotencyKey: crypto.randomUUID() }))); setDraftQuestions(data?.questions ?? []) }
+  }
+
+  async function searchDraftFood(index: number) {
+    if (!supabase) return
+    const item = draftItems[index]
+    if (!item) return
+    setDraftItems((current) => current.map((draft, i) => i === index ? { ...draft, searching: true, matches: [] } : draft))
+    const { data, error } = await supabase.functions.invoke('food-search', { body: { query: item.name } })
+    setDraftItems((current) => current.map((draft, i) => i === index ? { ...draft, searching: false, matches: error ? [] : (data?.foods ?? []) as Food[] } : draft))
+    if (error) setNotice('Не удалось сопоставить ингредиент с USDA. Проверьте серверную функцию food-search.')
+  }
+
+  function selectDraftFood(index: number, selected: Food) {
+    setDraftItems((current) => current.map((draft, i) => i === index ? { ...draft, selectedFood: selected, matches: [] } : draft))
+  }
+
+  async function confirmDraft() {
+    if (!supabase || confirmBusy) return
+    if (draftItems.length < 1 || draftItems.length > 12 || draftItems.some((item) => !item.selectedFood?.fdcId || !item.quantityGrams || item.quantityGrams < 1 || item.quantityGrams > 5000)) {
+      setNotice('Для каждого ингредиента выберите продукт USDA и проверьте массу от 1 до 5000 г.')
+      return
+    }
+    setConfirmBusy(true)
+    const { error } = await supabase.functions.invoke('confirm-analysis', { body: {
+      inputType: tab === 'photo' ? 'photo' : 'text', mealDate: selectedDate, mealType,
+      items: draftItems.map((item) => ({ fdcId: item.selectedFood?.fdcId, quantityGrams: item.quantityGrams, idempotencyKey: item.idempotencyKey })),
+    } })
+    setConfirmBusy(false)
+    if (error) { setNotice('Не удалось подтвердить блюдо. Проверьте сопоставление продуктов и разверните confirm-analysis.'); return }
+    setNotice('Блюдо подтверждено и атомарно сохранено в дневнике с проверенными данными USDA.')
+    setModal(false); setDraftItems([]); setDraftQuestions([]); await refreshDayEntries()
   }
 
   async function removeEntry(entry: Entry) {
@@ -192,8 +236,8 @@ function App() {
     {modal && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setModal(false) }}><section className="food-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><header className="modal-head"><div><span className="section-kicker">ДНЕВНИК ПИТАНИЯ</span><h2 id="modal-title">Добавить еду</h2></div><button className="close-button" onClick={() => setModal(false)} aria-label="Закрыть"><X size={20}/></button></header><div className="modal-tabs">{([['search', 'Поиск'], ['manual', 'Вручную'], ['photo', 'Фото'], ['text', 'Описание']] as const).map(([id, label]) => <button key={id} onClick={() => { setTab(id); setNotice(''); setDraftItems([]) }} className={tab === id ? 'selected' : ''}>{id === 'photo' && <Camera size={14}/>} {label}</button>)}</div>
       {tab === 'search' && <div className="modal-body"><form className="search-form" onSubmit={searchFoods}><Search size={18}/><input autoFocus placeholder="Например, яблоко или овсянка" value={query} onChange={(e) => setQuery(e.target.value)}/><button className="primary" disabled={searching || query.trim().length < 2}>{searching ? <LoaderCircle size={17} className="spin"/> : 'Найти'}</button></form><p className="helper">Ищем в USDA FoodData Central. Значения и источник будут показаны до сохранения.</p>{results.map((item) => <button className="food-result" key={`${item.fdcId}-${item.name}`} onClick={() => setFood(item)}><span className="food-result-icon"><Apple size={18}/></span><span><b>{item.name}</b><small>{item.brand || item.dataType || item.source}</small></span><span className="result-kcal">{display(item.nutrientsPer100g.energy_kcal)}<small> ккал/100 г</small></span><ChevronDown size={16}/></button>)}{food && <FoodReview food={food} grams={grams} setGrams={setGrams} mealType={mealType} setMealType={setMealType} onSave={() => saveFood(food)} onCancel={() => setFood(null)}/>}</div>}
       {tab === 'manual' && <form className="modal-body manual-form" onSubmit={saveManual}><div className="manual-note"><CircleHelp size={17}/> Введите данные с упаковки или проверенного источника. Пустое поле означает «неизвестно», не ноль.</div><label>Название продукта<input required value={manualName} onChange={(e) => setManualName(e.target.value)} placeholder="Например, домашний плов"/></label><div className="form-grid"><label>Ккал / 100 г<input type="number" min="0" step="any" value={manualKcal} onChange={(e) => setManualKcal(e.target.value)} placeholder="ккал"/></label><label>Белки, г / 100 г<input type="number" min="0" step="any" value={manualProtein} onChange={(e) => setManualProtein(e.target.value)} placeholder="г"/></label><label>Жиры, г / 100 г<input type="number" min="0" step="any" value={manualFat} onChange={(e) => setManualFat(e.target.value)} placeholder="г"/></label><label>Углеводы, г / 100 г<input type="number" min="0" step="any" value={manualCarbs} onChange={(e) => setManualCarbs(e.target.value)} placeholder="г"/></label></div><ReviewFields grams={grams} setGrams={setGrams} mealType={mealType} setMealType={setMealType}/><button className="primary wide"><Check size={17}/> Добавить в дневник</button></form>}
-      {tab === 'text' && <form className="modal-body manual-form" onSubmit={analyzeText}><label>Опишите блюдо<textarea rows={4} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Куриная грудка 180 г, рис 150 г в готовом виде, оливковое масло 10 г"/></label><p className="helper">ИИ предложит состав и задаст вопросы. Нутриенты рассчитаются только по выбранным продуктам из каталога.</p><button className="primary wide" disabled={analysisBusy || description.trim().length < 4}>{analysisBusy ? <LoaderCircle className="spin" size={17}/> : <Sparkles size={17}/>} Разобрать описание</button><DraftReview items={draftItems} questions={draftQuestions} setItems={setDraftItems}/></form>}
-      {tab === 'photo' && <form className="modal-body manual-form" onSubmit={analyzePhoto}><label className="upload-zone"><input type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)}/><span className="upload-icon"><Camera size={23}/></span><b>{photo ? photo.name : 'Выберите фотографию еды'}</b><small>JPG, PNG или WebP · до 8 МБ</small></label><p className="privacy-note"><ShieldCheck size={15}/> Фото передаётся серверу только для анализа и не появится в дневнике без вашего подтверждения.</p><button className="primary wide" disabled={!photo || analysisBusy}>{analysisBusy ? <LoaderCircle className="spin" size={17}/> : <Sparkles size={17}/>} Анализировать фото</button><DraftReview items={draftItems} questions={draftQuestions} setItems={setDraftItems}/></form>}
+      {tab === 'text' && <form className="modal-body manual-form" onSubmit={analyzeText}><label>Опишите блюдо<textarea rows={4} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Куриная грудка 180 г, рис 150 г в готовом виде, оливковое масло 10 г"/></label><p className="helper">ИИ предложит состав и задаст вопросы. Нутриенты рассчитаются только по выбранным продуктам из каталога.</p><button className="primary wide" disabled={analysisBusy || description.trim().length < 4}>{analysisBusy ? <LoaderCircle className="spin" size={17}/> : <Sparkles size={17}/>} Разобрать описание</button><DraftReview items={draftItems} questions={draftQuestions} setItems={setDraftItems} onSearchFood={searchDraftFood} onSelectFood={selectDraftFood} onConfirm={confirmDraft} confirmBusy={confirmBusy} mealType={mealType} setMealType={setMealType} selectedDate={selectedDate}/></form>}
+      {tab === 'photo' && <form className="modal-body manual-form" onSubmit={analyzePhoto}><label className="upload-zone"><input type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)}/><span className="upload-icon"><Camera size={23}/></span><b>{photo ? photo.name : 'Выберите фотографию еды'}</b><small>JPG, PNG или WebP · до 8 МБ</small></label><p className="privacy-note"><ShieldCheck size={15}/> Фото передаётся серверу только для анализа и не появится в дневнике без вашего подтверждения.</p><button className="primary wide" disabled={!photo || analysisBusy}>{analysisBusy ? <LoaderCircle className="spin" size={17}/> : <Sparkles size={17}/>} Анализировать фото</button><DraftReview items={draftItems} questions={draftQuestions} setItems={setDraftItems} onSearchFood={searchDraftFood} onSelectFood={selectDraftFood} onConfirm={confirmDraft} confirmBusy={confirmBusy} mealType={mealType} setMealType={setMealType} selectedDate={selectedDate}/></form>}
       </section></div>}
     </div>
 }
@@ -204,9 +248,14 @@ function ReviewFields({ grams, setGrams, mealType, setMealType }: { grams: strin
 
 function FoodReview({ food, grams, setGrams, mealType, setMealType, onSave, onCancel }: { food: Food; grams: string; setGrams: (value: string) => void; mealType: MealType; setMealType: (value: MealType) => void; onSave: () => void; onCancel: () => void }) { const amount = Number(grams) || 0; return <div className="review-card"><div className="review-title"><div><span className="section-kicker">ПРЕДВАРИТЕЛЬНЫЙ РАСЧЁТ</span><h3>{food.name}</h3></div><button className="close-button" onClick={onCancel} aria-label="Закрыть"><X size={16}/></button></div><div className="nutrient-strip"><span><b>{display(portionValue(food.nutrientsPer100g.energy_kcal, amount))}</b><small>ккал</small></span><span><b>{display(portionValue(food.nutrientsPer100g.protein_g, amount))}</b><small>белки, г</small></span><span><b>{display(portionValue(food.nutrientsPer100g.fat_g, amount))}</b><small>жиры, г</small></span><span><b>{display(portionValue(food.nutrientsPer100g.carbohydrate_g, amount))}</b><small>углеводы, г</small></span></div><div className="data-source"><ShieldCheck size={15}/><span>Источник: {food.source}{food.sourceReference ? ` · ${food.sourceReference}` : ''}. На порцию посчитано пропорционально массе.</span></div><ReviewFields grams={grams} setGrams={setGrams} mealType={mealType} setMealType={setMealType}/><button className="primary wide" onClick={onSave}><Check size={16}/> Подтвердить и добавить</button></div> }
 
-function DraftReview({ items, questions, setItems }: { items: Array<{ name: string; quantityGrams: number | null; state: string | null; needsConfirmation: boolean }>; questions: string[]; setItems: (items: Array<{ name: string; quantityGrams: number | null; state: string | null; needsConfirmation: boolean }>) => void }) {
+function DraftReview({ items, questions, setItems, onSearchFood, onSelectFood, onConfirm, confirmBusy, mealType, setMealType, selectedDate }: {
+  items: DraftItem[]; questions: string[]; setItems: (items: DraftItem[] | ((current: DraftItem[]) => DraftItem[])) => void
+  onSearchFood: (index: number) => void; onSelectFood: (index: number, food: Food) => void; onConfirm: () => void
+  confirmBusy: boolean; mealType: MealType; setMealType: (type: MealType) => void; selectedDate: string
+}) {
   if (!items.length && !questions.length) return null
-  return <div className="draft-review"><div className="draft-heading"><span className="section-kicker">НУЖНА ВАША ПРОВЕРКА</span><span className="draft-status"><span className="live-dot"/> Черновик анализа</span></div>{questions.map((question) => <p className="draft-question" key={question}>{question}</p>)}{items.map((item, i) => <div className="draft-item" key={`${item.name}-${i}`}><div><b>{item.name}</b><small>{item.state || 'состояние не определено'} · оценка ИИ, проверьте</small></div><label><input aria-label={`Масса ${item.name}`} type="number" min="1" max="5000" value={item.quantityGrams ?? ''} onChange={(e) => setItems(items.map((x, index) => index === i ? { ...x, quantityGrams: e.target.value ? Number(e.target.value) : null } : x))}/> г</label><button className="close-button" aria-label="Удалить ингредиент" onClick={() => setItems(items.filter((_, index) => index !== i))}><X size={15}/></button></div>)}{items.length > 0 && <p className="helper">Состав не добавлен в дневник. Сопоставьте ингредиенты с каталогом, чтобы рассчитать нутриенты.</p>}</div>
+  const ready = items.length > 0 && items.every((item) => item.selectedFood?.fdcId && item.quantityGrams != null && item.quantityGrams >= 1 && item.quantityGrams <= 5000)
+  return <div className="draft-review"><div className="draft-heading"><span className="section-kicker">ПРОВЕРЬТЕ СОСТАВ</span><span className="draft-status"><span className="live-dot"/> Черновик · не сохранён</span></div>{questions.map((question) => <p className="draft-question" key={question}>{question}</p>)}{items.map((item, i) => <div className="draft-row" key={item.idempotencyKey}><div className="draft-item"><div><b>{item.name}</b><small>{item.state || 'состояние не определено'} · предположение ИИ</small></div><label><input aria-label={`Масса ${item.name}`} type="number" min="1" max="5000" value={item.quantityGrams ?? ''} onChange={(e) => setItems((current) => current.map((x, index) => index === i ? { ...x, quantityGrams: e.target.value ? Number(e.target.value) : null } : x))}/> г</label><button type="button" className="close-button" aria-label="Удалить ингредиент" onClick={() => setItems((current) => current.filter((_, index) => index !== i))}><X size={15}/></button></div><div className="draft-match">{item.selectedFood ? <span><ShieldCheck size={13}/> {item.selectedFood.name} · {item.selectedFood.sourceReference}</span> : <span className="unmatched">Сопоставьте с проверенным продуктом</span>}<button type="button" className="match-button" disabled={item.searching} onClick={() => onSearchFood(i)}>{item.searching ? <LoaderCircle size={13} className="spin"/> : <Search size={13}/>} {item.selectedFood ? 'Изменить продукт' : 'Найти в USDA'}</button></div>{item.matches?.map((match) => <button type="button" className="draft-match-result" key={`${match.fdcId}-${match.name}`} onClick={() => onSelectFood(i, match)}><span>{match.name}<small>{match.brand || match.dataType || 'USDA FoodData Central'}</small></span><b>{display(match.nutrientsPer100g.energy_kcal)} ккал/100 г</b><Check size={14}/></button>)}</div>)}{items.length > 0 && <div className="draft-confirm"><label>Приём пищи<select value={mealType} onChange={(e) => setMealType(e.target.value as MealType)}>{Object.entries(mealNames).map(([key, value]) => <option key={key} value={key}>{value}</option>)}</select></label><span>Дата дневника: {selectedDate}</span><button type="button" className="primary wide" disabled={!ready || confirmBusy} onClick={onConfirm}>{confirmBusy ? <LoaderCircle size={16} className="spin"/> : <Check size={16}/>} Подтвердить и сохранить блюдо</button><p className="helper">Сервер повторно проверит данные USDA. Все компоненты сохранятся вместе; неизвестные нутриенты останутся пустыми.</p></div>}</div>
 }
 
 function SecondaryPage({ page, entries, goal, setGoal, setNotice, signOut }: { page: Page; entries: Entry[]; goal: number | null; setGoal: (goal: number | null) => void; setNotice: (message: string) => void; signOut: () => void }) { const [goalText, setGoalText] = useState(goal?.toString() ?? ''); const grouped = useMemo(() => entries.reduce<Record<string, number>>((acc, entry) => { acc[entry.meal_type] = (acc[entry.meal_type] ?? 0) + (entry.energy_kcal_snapshot ?? 0); return acc }, {}), [entries]); if (page === 'analytics') return <div className="secondary-content"><section className="section-head"><div><span className="section-kicker">СЕГОДНЯ</span><h2>Наблюдайте за ритмом</h2></div></section><div className="analytics-panel"><div className="chart-header"><div><span>Калории по приёмам</span><small>Показаны только записи выбранного дня</small></div><BarChart3 size={20}/></div><div className="bars">{Object.entries(mealNames).map(([key, name]) => { const value = grouped[key] ?? 0; const max = Math.max(goal ?? 0, ...Object.values(grouped), 100); return <div className="bar-col" key={key}><span>{value ? display(value) : '—'}</span><div className="bar-bg"><i style={{ height: `${Math.max(3, value / max * 100)}%` }}/></div><small>{name}</small></div> })}</div><p className="helper">История начнёт строиться по мере сохранения записей. Пустые дни и отсутствующие нутриенты не считаются нулевыми значениями.</p></div></div>; if (page === 'settings') return <div className="secondary-content"><section className="settings-card"><div className="settings-icon"><Flame size={19}/></div><div className="settings-copy"><h3>Дневная цель калорий</h3><p>Это ориентир для сравнения, не медицинская рекомендация. Можно оставить пустым.</p><div className="goal-edit"><input type="number" min="1" max="10000" value={goalText} onChange={(e) => setGoalText(e.target.value)} placeholder="Например, 2000"/><span>ккал</span><button className="primary" onClick={async () => { const value = goalText.trim() === '' ? null : Number(goalText); if (value !== null && (!Number.isFinite(value) || value < 1 || value > 10000)) { setNotice('Укажите цель от 1 до 10000 ккал или оставьте пустой.'); return }; if (!supabase) return; const userResult = await supabase.auth.getUser(); const uid = userResult.data.user?.id; if (!uid) return; const today = localDateISO(); const { error } = await supabase.from('user_goals').insert({ user_id: uid, effective_from: today, daily_calorie_goal: value }); if (error) setNotice(error.message); else { setGoal(value); setNotice('Цель сохранена в облаке.') } }}>Сохранить</button></div></div></section><section className="settings-card"><div className="settings-icon"><ShieldCheck size={19}/></div><div className="settings-copy"><h3>Данные и приватность</h3><p>Профиль и дневник привязаны к вашей учётной записи. Политики доступа ограничивают чтение и изменение ваших записей.</p><button className="text-button danger-button" onClick={signOut}>Выйти из аккаунта <LogOut size={15}/></button></div></section></div>; if (page === 'recipes') return <div className="empty-state"><div className="empty-illustration">♡</div><h2>Здесь будут ваши рецепты</h2><p>Сохраняйте любимые блюда и добавляйте их в дневник повторно. Управление рецептами появится после базового сценария дневника.</p></div>; return <div className="secondary-content"><div className="history-header"><h2>История по приёмам</h2><span>{entries.length} записей</span></div>{entries.length ? entries.map((entry) => <div className="history-row" key={entry.id}><span className="history-dot"/><div><b>{entry.name}</b><small>{mealNames[entry.meal_type]} · {display(entry.quantity_g, ' г')}</small></div><strong>{display(entry.energy_kcal_snapshot)} ккал</strong></div>) : <div className="empty-state compact"><div className="empty-illustration"><Utensils size={25}/></div><h2>Пока день пуст</h2><p>После добавления еды история появится здесь.</p></div>}</div> }
