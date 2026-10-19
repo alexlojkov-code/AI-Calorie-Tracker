@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+supabase/functions/.env
+.DS_Store
+node_modules/
+web/node_modules/
+web/dist/
+web/.env.local
+web/.env.*.local
+*.tsbuildinfo
