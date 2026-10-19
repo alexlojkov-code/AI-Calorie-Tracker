@@ -1,0 +1,21 @@
+project_id = "ai-calorie-tracker"
+
+[api]
+enabled = true
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[auth]
+enabled = true
+site_url = "http://localhost:5173"
+additional_redirect_urls = ["http://127.0.0.1:5173"]
+
+[functions.food-search]
+verify_jwt = true
+
+[functions.parse-meal]
+verify_jwt = true
+
+[functions.food-analysis]
+verify_jwt = true
