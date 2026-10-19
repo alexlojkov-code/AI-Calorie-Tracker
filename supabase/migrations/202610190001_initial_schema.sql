@@ -123,3 +123,143 @@ grant usage on schema public to authenticated;
 grant select on public.foods,public.food_nutrients to authenticated;
 grant select,insert on public.user_goals to authenticated;
 grant select,insert,update,delete on public.profiles,public.custom_foods,public.meals,public.meal_items,public.favorite_foods,public.recipes,public.recipe_items,public.food_analyses,public.food_analysis_items,public.ai_conversations,public.ai_messages to authenticated;
+
+create or replace function public.record_verified_food(
+  p_user_id uuid, p_meal_date date, p_meal_type public.meal_type, p_fdc_id bigint,
+  p_name text, p_quantity_g numeric, p_nutrients jsonb, p_idempotency_key uuid
+) returns uuid language plpgsql security definer set search_path = '' as $$
+declare
+  v_meal_id uuid;
+  v_item_id uuid;
+  v_energy numeric;
+  v_protein numeric;
+  v_fat numeric;
+  v_carbs numeric;
+  v_fiber numeric;
+begin
+  if p_user_id is null or p_fdc_id <= 0 or p_name is null or length(trim(p_name)) not between 1 and 180
+     or p_quantity_g is null or p_quantity_g not between 0.01 and 5000 or p_idempotency_key is null then
+    raise exception using errcode = '22023', message = 'Invalid verified food input';
+  end if;
+  if jsonb_typeof(p_nutrients) <> 'object' then
+    raise exception using errcode = '22023', message = 'Invalid nutrient data';
+  end if;
+  if exists (
+    select 1 from unnest(array['energy_kcal','protein_g','fat_g','carbohydrate_g','fiber_g']) as key_name
+    where not (p_nutrients ? key_name)
+       or jsonb_typeof(p_nutrients -> key_name) not in ('number','null')
+  ) then
+    raise exception using errcode = '22023', message = 'Invalid nutrient data';
+  end if;
+  v_energy := (p_nutrients ->> 'energy_kcal')::numeric;
+  v_protein := (p_nutrients ->> 'protein_g')::numeric;
+  v_fat := (p_nutrients ->> 'fat_g')::numeric;
+  v_carbs := (p_nutrients ->> 'carbohydrate_g')::numeric;
+  v_fiber := (p_nutrients ->> 'fiber_g')::numeric;
+  if v_energy < 0 or v_protein < 0 or v_fat < 0 or v_carbs < 0 or v_fiber < 0 then
+    raise exception using errcode = '22023', message = 'Nutrients cannot be negative';
+  end if;
+
+  insert into public.meals(user_id, meal_date, meal_type)
+  values (p_user_id, p_meal_date, p_meal_type)
+  on conflict (user_id, meal_date, meal_type) do update set updated_at = now()
+  returning id into v_meal_id;
+
+  insert into public.meal_items(
+    meal_id, custom_name, quantity_g, energy_kcal_snapshot, protein_g_snapshot,
+    fat_g_snapshot, carbohydrate_g_snapshot, fiber_g_snapshot, nutrition_snapshot,
+    source_type, source_reference, idempotency_key
+  ) values (
+    v_meal_id, trim(p_name), p_quantity_g,
+    v_energy * p_quantity_g / 100, v_protein * p_quantity_g / 100,
+    v_fat * p_quantity_g / 100, v_carbs * p_quantity_g / 100, v_fiber * p_quantity_g / 100,
+    p_nutrients || jsonb_build_object('data_source','USDA FoodData Central','source_reference','FDC ' || p_fdc_id::text),
+    'manual', 'FDC ' || p_fdc_id::text, p_idempotency_key
+  ) on conflict (idempotency_key) do nothing returning id into v_item_id;
+
+  if v_item_id is null then
+    select id into v_item_id from public.meal_items where idempotency_key = p_idempotency_key and meal_id = v_meal_id;
+    if v_item_id is null then
+      raise exception using errcode = '23505', message = 'Idempotency key is already in use';
+    end if;
+  end if;
+  return v_item_id;
+end;
+$$;
+revoke all on function public.record_verified_food(uuid,date,public.meal_type,bigint,text,numeric,jsonb,uuid) from public, anon, authenticated;
+grant execute on function public.record_verified_food(uuid,date,public.meal_type,bigint,text,numeric,jsonb,uuid) to service_role;
+
+create or replace function public.record_verified_food_batch(
+  p_user_id uuid, p_meal_date date, p_meal_type public.meal_type, p_source_type public.food_source_type, p_items jsonb
+) returns uuid[] language plpgsql security definer set search_path = '' as $$
+declare
+  v_meal_id uuid;
+  v_item_id uuid;
+  v_ids uuid[] := array[]::uuid[];
+  v_item jsonb;
+  v_fdc_id bigint;
+  v_name text;
+  v_quantity numeric;
+  v_key uuid;
+  v_nutrients jsonb;
+  v_energy numeric;
+  v_protein numeric;
+  v_fat numeric;
+  v_carbs numeric;
+  v_fiber numeric;
+begin
+  if p_user_id is null or p_source_type is null or p_source_type not in ('photo','text') or jsonb_typeof(p_items) <> 'array'
+     or jsonb_array_length(p_items) not between 1 and 12 then
+    raise exception using errcode = '22023', message = 'Invalid analysis confirmation';
+  end if;
+  insert into public.meals(user_id, meal_date, meal_type)
+  values (p_user_id, p_meal_date, p_meal_type)
+  on conflict (user_id, meal_date, meal_type) do update set updated_at = now()
+  returning id into v_meal_id;
+
+  for v_item in select value from jsonb_array_elements(p_items) loop
+    v_fdc_id := (v_item ->> 'fdcId')::bigint;
+    v_name := trim(v_item ->> 'name');
+    v_quantity := (v_item ->> 'quantityGrams')::numeric;
+    v_key := (v_item ->> 'idempotencyKey')::uuid;
+    v_nutrients := v_item -> 'nutrients';
+    if v_fdc_id <= 0 or v_name is null or length(v_name) not between 1 and 180 or v_quantity not between 0.01 and 5000 or v_key is null
+       or jsonb_typeof(v_nutrients) <> 'object' then
+      raise exception using errcode = '22023', message = 'Invalid confirmed food item';
+    end if;
+    if exists (
+      select 1 from unnest(array['energy_kcal','protein_g','fat_g','carbohydrate_g','fiber_g']) as key_name
+      where not (v_nutrients ? key_name) or jsonb_typeof(v_nutrients -> key_name) not in ('number','null')
+    ) then
+      raise exception using errcode = '22023', message = 'Invalid nutrient data';
+    end if;
+    v_energy := (v_nutrients ->> 'energy_kcal')::numeric;
+    v_protein := (v_nutrients ->> 'protein_g')::numeric;
+    v_fat := (v_nutrients ->> 'fat_g')::numeric;
+    v_carbs := (v_nutrients ->> 'carbohydrate_g')::numeric;
+    v_fiber := (v_nutrients ->> 'fiber_g')::numeric;
+    if v_energy < 0 or v_protein < 0 or v_fat < 0 or v_carbs < 0 or v_fiber < 0 then
+      raise exception using errcode = '22023', message = 'Nutrients cannot be negative';
+    end if;
+    insert into public.meal_items(
+      meal_id, custom_name, quantity_g, energy_kcal_snapshot, protein_g_snapshot,
+      fat_g_snapshot, carbohydrate_g_snapshot, fiber_g_snapshot, nutrition_snapshot,
+      source_type, source_reference, idempotency_key
+    ) values (
+      v_meal_id, v_name, v_quantity,
+      v_energy * v_quantity / 100, v_protein * v_quantity / 100,
+      v_fat * v_quantity / 100, v_carbs * v_quantity / 100, v_fiber * v_quantity / 100,
+      v_nutrients || jsonb_build_object('data_source','USDA FoodData Central','source_reference','FDC ' || v_fdc_id::text),
+      p_source_type, 'FDC ' || v_fdc_id::text, v_key
+    ) on conflict (idempotency_key) do nothing returning id into v_item_id;
+    if v_item_id is null then
+      select id into v_item_id from public.meal_items where idempotency_key = v_key and meal_id = v_meal_id;
+      if v_item_id is null then raise exception using errcode = '23505', message = 'Idempotency key is already in use'; end if;
+    end if;
+    v_ids := array_append(v_ids, v_item_id);
+  end loop;
+  return v_ids;
+end;
+$$;
+revoke all on function public.record_verified_food_batch(uuid,date,public.meal_type,public.food_source_type,jsonb) from public, anon, authenticated;
+grant execute on function public.record_verified_food_batch(uuid,date,public.meal_type,public.food_source_type,jsonb) to service_role;
