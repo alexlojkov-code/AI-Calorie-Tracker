@@ -14,8 +14,14 @@ additional_redirect_urls = ["http://127.0.0.1:5173"]
 [functions.food-search]
 verify_jwt = true
 
+[functions.add-food]
+verify_jwt = true
+
 [functions.parse-meal]
 verify_jwt = true
 
 [functions.food-analysis]
+verify_jwt = true
+
+[functions.confirm-analysis]
 verify_jwt = true
